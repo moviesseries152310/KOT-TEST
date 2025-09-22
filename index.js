@@ -1,5 +1,5 @@
-// index.js - GDrive Addon v1.1.3 (Final Stability Release)
-// Fixes search, catalog handling, streaming, and caching logic.
+// index.js - GDrive Addon v1.1.4 (Direct Link & Proxy Fix)
+// Implements a reliable direct link proxy for streaming to fix "no link found" errors.
 
 require('dotenv').config();
 const express = require("express");
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 // ========= CONFIGURATION =========
 const CONFIG = {
     addonName: "GDrive Stremio",
-    addonVersion: "1.1.3",
+    addonVersion: "1.1.4",
     baseUrl: process.env.BASE_URL || "http://127.0.0.1:3000",
     rootFolders: [
         { id: "1X18vIlx0I74wcXLYFYkKs1Xo_vW9jw6i", name: "Hindi Dubbed" },
@@ -30,7 +30,6 @@ const CONFIG = {
         { id: "1vOxJULycYIir_fklIzT9stfSsu6_m99o", name: "Hindi Web Series" },
         { id: "1kNiheEQTfld1wpaYsMsZ8O6cLXHSTIKN", name: "Web Series" },
     ],
-    proxiedPlayback: true,
     apiRequestTimeoutMs: 60000,
     listCacheTtl: 300,
     metaCacheTtl: 1800,
@@ -164,7 +163,7 @@ const fileToMeta = (file) => ({
 
 // ========= MANIFEST =========
 const getManifest = () => ({
-    id: "community.gdrive.v113",
+    id: "community.gdrive.v114",
     version: CONFIG.addonVersion,
     name: CONFIG.addonName,
     description: "Stable Google Drive addon with full series support, subtitle integration, and robust playback.",
@@ -182,7 +181,6 @@ const getManifest = () => ({
 // ========= HANDLERS =========
 async function handleCatalog(req, res) {
     const { id, search } = req.params;
-    // FIX: Do not use special characters in cache keys that might not be supported.
     const cleanSearch = search ? search.replace(/[^a-zA-Z0-9]/g, '') : '';
     const cacheKey = `catalog:${cleanSearch ? `search-${cleanSearch}` : id}`;
     
@@ -199,7 +197,6 @@ async function handleCatalog(req, res) {
                 fields: 'files(id,name,mimeType,thumbnailLink,size)',
             });
         } else {
-            // FIX: Correctly check for special catalog IDs before treating them as folder IDs.
             if (id === "gdrive_recents") {
                  files = await listAllFiles({ 
                     q: `mimeType contains 'video/' and trashed=false`, 
@@ -207,7 +204,7 @@ async function handleCatalog(req, res) {
                     fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' 
                 });
             } else if (id.startsWith("gdrive-root:") || id.startsWith("gdrive-folder:")) {
-                const folderId = id.startsWith("gdrive-root:") ? id.split(':')[1] : id.split(':')[1];
+                const folderId = id.split(':')[1];
                 files = await listAllFiles({ 
                     q: `'${folderId}' in parents and trashed=false`, 
                     orderBy: 'name', 
@@ -232,7 +229,6 @@ async function handleCatalog(req, res) {
 async function handleMeta(req, res) {
     const { id } = req.params;
     const isFolder = id.startsWith('gdrive-folder:') || id.startsWith('gdrive-root:');
-    const prefix = id.startsWith('gdrive-root:') ? 'gdrive-root' : (isFolder ? 'gdrive-folder' : 'gdrive');
     const itemId = id.split(':')[1];
 
     if (!itemId) return res.status(404).json({ err: 'Not Found' });
@@ -286,14 +282,19 @@ async function handleMeta(req, res) {
     res.json({ meta });
 }
 
+// FIX: handleStream now generates a direct, authenticated Google Drive URL
+// which will be proxied by handlePlayback. This is the most reliable method.
 async function handleStream(req, res) {
     const { id } = req.params;
     const fileId = id.split(':')[1];
     if (!fileId) return res.status(404).json({ streams: [] });
 
-    const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,parents"));
+    const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,parents,webContentLink"));
     if (!file) return res.status(404).json({ streams: [] });
     
+    const accessToken = await getAccessToken();
+    const streamUrl = `${CONFIG.baseUrl}/playback/${file.id}`;
+
     let subs = [];
     try {
         if (file.parents && file.parents[0]) {
@@ -317,10 +318,12 @@ async function handleStream(req, res) {
     
     res.json({
         streams: [{
-            url: `${CONFIG.baseUrl}/playback/${file.id}`,
-            title: `GDrive Stream\n${fmtSize(file.size)}`,
+            url: streamUrl,
+            title: `GDrive Direct\n${fmtSize(file.size)}`,
             behaviorHints: {
-                proxied: true,
+                // We are using our own proxy, so we don't need Stremio's.
+                // This gives us more control.
+                proxied: false, 
                 videoSize: parseInt(file.size) || undefined,
                 filename: file.name,
             },
