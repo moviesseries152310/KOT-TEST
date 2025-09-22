@@ -1,7 +1,7 @@
 {
   "name": "stremio-gdrive-addon",
-  "version": "1.0.5",
-  "description": "Stremio Google Drive addon with secure environment variables for service accounts.",
+  "version": "1.0.9",
+  "description": "Stremio Google Drive addon using OAuth 2.0",
   "main": "index.js",
   "engines": {
     "node": ">=18"
@@ -23,6 +23,8 @@
     "@upstash/redis": "^1.28.4",
     "connect-timeout": "^1.9.0",
     "dotenv": "^16.3.1",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "abort-controller": "^3.0.0"
   }
 }
+
