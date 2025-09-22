@@ -1,5 +1,5 @@
-// index.js - GDrive Addon v1.1.4 (Direct Link & Proxy Fix)
-// Implements a reliable direct link proxy for streaming to fix "no link found" errors.
+// index.js - GDrive Addon v1.1.5 (Nested Folder & Streaming Fix)
+// Fixes issues with nested season folders and improves stream link reliability.
 
 require('dotenv').config();
 const express = require("express");
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 // ========= CONFIGURATION =========
 const CONFIG = {
     addonName: "GDrive Stremio",
-    addonVersion: "1.1.4",
+    addonVersion: "1.1.5",
     baseUrl: process.env.BASE_URL || "http://127.0.0.1:3000",
     rootFolders: [
         { id: "1X18vIlx0I74wcXLYFYkKs1Xo_vW9jw6i", name: "Hindi Dubbed" },
@@ -163,7 +163,7 @@ const fileToMeta = (file) => ({
 
 // ========= MANIFEST =========
 const getManifest = () => ({
-    id: "community.gdrive.v114",
+    id: "community.gdrive.v115",
     version: CONFIG.addonVersion,
     name: CONFIG.addonName,
     description: "Stable Google Drive addon with full series support, subtitle integration, and robust playback.",
@@ -241,11 +241,20 @@ async function handleMeta(req, res) {
 
     let meta;
     if (isFolder) {
-        const [folder, allContents] = await Promise.all([
-            gjson(API.DRIVE_FILE(itemId, "id,name")),
-            listAllFiles({ q: `'${itemId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,createdTime,size,thumbnailLink)', orderBy: 'name' })
-        ]);
+        const folder = await gjson(API.DRIVE_FILE(itemId, "id,name"));
         if (!folder) return res.status(404).json({ err: 'Not Found' });
+
+        let allContents = await listAllFiles({ q: `'${itemId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,createdTime,size,thumbnailLink)', orderBy: 'name' });
+        
+        // FIX: Check for nested season folders. If the main folder only contains other folders, dive into them.
+        const containsOnlyFolders = allContents.length > 0 && allContents.every(f => f.mimeType === FOLDER_MIME);
+        if (containsOnlyFolders) {
+            const nestedFilesPromises = allContents.map(subfolder => 
+                listAllFiles({ q: `'${subfolder.id}' in parents and trashed=false`, fields: 'files(id,name,mimeType,createdTime,size,thumbnailLink)', orderBy: 'name' })
+            );
+            const nestedFilesArrays = await Promise.all(nestedFilesPromises);
+            allContents = [].concat(...nestedFilesArrays); // Flatten the array of arrays
+        }
         
         const videos = allContents.filter(f => f.mimeType && f.mimeType.startsWith('video/'));
         const firstVideoWithThumb = videos.find(v => v.thumbnailLink);
@@ -282,17 +291,14 @@ async function handleMeta(req, res) {
     res.json({ meta });
 }
 
-// FIX: handleStream now generates a direct, authenticated Google Drive URL
-// which will be proxied by handlePlayback. This is the most reliable method.
 async function handleStream(req, res) {
     const { id } = req.params;
     const fileId = id.split(':')[1];
     if (!fileId) return res.status(404).json({ streams: [] });
 
-    const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,parents,webContentLink"));
+    const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,parents"));
     if (!file) return res.status(404).json({ streams: [] });
     
-    const accessToken = await getAccessToken();
     const streamUrl = `${CONFIG.baseUrl}/playback/${file.id}`;
 
     let subs = [];
@@ -321,8 +327,6 @@ async function handleStream(req, res) {
             url: streamUrl,
             title: `GDrive Direct\n${fmtSize(file.size)}`,
             behaviorHints: {
-                // We are using our own proxy, so we don't need Stremio's.
-                // This gives us more control.
                 proxied: false, 
                 videoSize: parseInt(file.size) || undefined,
                 filename: file.name,
