@@ -119,15 +119,67 @@ async function gjson(url) {
     return r.json();
 }
 
+// ========= UTILITY FUNCTIONS =========
+function fmtSize(bytes) {
+  if (!bytes || isNaN(bytes)) return "Unknown";
+  const k = 1000, units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${units[i]}`;
+}
+
+function extractId(idParam, prefix) {
+    if (!idParam || typeof idParam !== 'string') return null;
+    let decoded = decodeURIComponent(idParam);
+    if (decoded.startsWith(prefix + ":")) return decoded.split(":")[1];
+    if (decoded.match(/^[a-zA-Z0-9_-]{25,}/)) return decoded;
+    return null;
+}
+
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
+function fileToMeta(file) {
+    const isFolder = file.mimeType === FOLDER_MIME;
+    return {
+        id: isFolder ? `gdrive-folder:${file.id}` : `gdrive:${file.id}`,
+        type: isFolder ? 'series' : 'movie',
+        name: file.name,
+        poster: isFolder ? "https://i.imgur.com/G4A4B1a.png" : file.thumbnailLink,
+        description: isFolder ? "Folder" : `Size: ${fmtSize(file.size)}`
+    };
+}
+
+
+// ========= MANIFEST =========
+function getManifest() {
+    return {
+        id: "community.gdrive.v109",
+        version: "1.0.9",
+        name: CONFIG.addonName,
+        description: "Google Drive addon using OAuth 2.0. Streams movies and series directly from your Google Drive.",
+        logo: "https://upload.wikimedia.org/wikipedia/commons/thumb/1/12/Google_Drive_icon_%282020%29.svg/2295px-Google_Drive_icon_%282020%29.svg.png",
+        types: ["movie", "series"],
+        catalogs: [
+            { type: "movie", id: "gdrive_recents", name: "Recent Videos" },
+            ...CONFIG.rootFolders.map(folder => ({
+                type: "movie",
+                id: `gdrive-root:${folder.id}`,
+                name: folder.name
+            })),
+            { type: "movie", id: "gdrive_search", name: "Search", extra: [{ name: "search", isRequired: true }] }
+        ],
+        resources: ["stream", "meta", "catalog"],
+        idPrefixes: ["gdrive"],
+    };
+}
+
 // ========= ROUTE HANDLERS (Full Implementation) =========
 async function handleCatalog(req, res) {
-    const { type, id } = req.params;
-    const { search } = req.params;
-
+    const { id, search } = req.params;
     let metas = [];
     const cacheKey = `catalog:${search ? `search:${search}` : id}`;
     
-    // Caching logic here if needed
+    const cached = await kvCache.get(cacheKey);
+    if (cached) return res.json({ metas: cached });
 
     if (search) {
         const r = await gjson(`${API.DRIVE_FILES}?q=name contains '${search}' and trashed=false&fields=files(id,name,mimeType,thumbnailLink,size)`);
@@ -141,26 +193,60 @@ async function handleCatalog(req, res) {
         if(r && r.files) metas = r.files.map(fileToMeta);
     }
     
+    if (metas.length > 0) {
+        await kvCache.setex(cacheKey, CONFIG.listCacheTtl, JSON.stringify(metas));
+    }
+
     res.json({ metas });
 }
 
 async function handleMeta(req, res) {
     const { id } = req.params;
-    const fileId = extractId(id, 'gdrive');
-    if (!fileId) return res.status(404).json({ err: 'Not Found' });
+    const isFolder = id.startsWith('gdrive-folder:');
+    const itemId = extractId(id, isFolder ? 'gdrive-folder' : 'gdrive');
+
+    if (!itemId) return res.status(404).json({ err: 'Not Found' });
     
-    const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,thumbnailLink,createdTime,videoMediaMetadata"));
-    if (!file) return res.status(404).json({ err: 'Not Found' });
+    const cacheKey = `meta:${id}`;
+    const cached = await kvCache.get(cacheKey);
+    if (cached) return res.json({ meta: JSON.parse(cached) });
 
-    const meta = {
-        id: `gdrive:${file.id}`,
-        name: file.name,
-        type: 'movie',
-        poster: file.thumbnailLink,
-        background: file.thumbnailLink,
-        description: `Size: ${fmtSize(file.size)}`
-    };
+    let meta;
+    if (isFolder) {
+        const folder = await gjson(API.DRIVE_FILE(itemId, "id,name"));
+        if (!folder) return res.status(404).json({ err: 'Not Found' });
+        const filesRes = await gjson(`${API.DRIVE_FILES}?q='${itemId}' in parents and trashed=false and mimeType contains 'video/'&fields=files(id,name,createdTime,size,thumbnailLink,videoMediaMetadata)`);
+        
+        meta = {
+            id,
+            name: folder.name,
+            type: 'series',
+            poster: "https://i.imgur.com/G4A4B1a.png",
+            videos: filesRes.files.map((file, index) => ({
+                id: `gdrive:${file.id}`,
+                title: file.name,
+                season: 1,
+                episode: index + 1,
+                released: file.createdTime,
+                thumbnail: file.thumbnailLink,
+                streams: [{ url: `${CONFIG.baseUrl}/playback/${file.id}`, title: "GDrive Stream" }]
+            }))
+        };
+    } else {
+        const file = await gjson(API.DRIVE_FILE(itemId, "id,name,size,thumbnailLink,createdTime,videoMediaMetadata"));
+        if (!file) return res.status(404).json({ err: 'Not Found' });
 
+        meta = {
+            id: `gdrive:${file.id}`,
+            name: file.name,
+            type: 'movie',
+            poster: file.thumbnailLink,
+            background: file.thumbnailLink,
+            description: `Size: ${fmtSize(file.size)}`
+        };
+    }
+
+    await kvCache.setex(cacheKey, CONFIG.metaCacheTtl, JSON.stringify(meta));
     res.json({ meta });
 }
 
@@ -174,27 +260,54 @@ async function handleStream(req, res) {
     
     const stream = {
         url: `${CONFIG.baseUrl}/playback/${file.id}`,
-        title: `GDrive - ${file.name}`,
+        title: `GDrive`,
         behaviorHints: {
             proxied: true,
-            videoSize: file.size ? parseInt(file.size) : undefined
+            videoSize: file.size ? parseInt(file.size) : undefined,
+            filename: file.name
         }
     };
     
     res.json({ streams: [stream] });
 }
 
+async function handlePlayback(req, res) {
+    try {
+        const fileId = req.params.id;
+        if (!fileId) return res.status(400).send("File ID required");
 
-// ========= HELPER for converting file object to meta object =========
-function fileToMeta(file) {
-    const isFolder = file.mimeType === FOLDER_MIME;
-    return {
-        id: isFolder ? `gdrive-folder:${file.id}` : `gdrive:${file.id}`,
-        type: isFolder ? 'series' : 'movie',
-        name: file.name,
-        poster: isFolder ? "https://i.imgur.com/G4A4B1a.png" : file.thumbnailLink,
-        description: isFolder ? "Folder" : `Size: ${fmtSize(file.size)}`
-    };
+        const accessToken = await getAccessToken();
+        const driveUrl = API.DRIVE_MEDIA(fileId);
+        
+        const range = req.headers.range;
+        const headers = { 'Authorization': `Bearer ${accessToken}`, 'User-Agent': req.headers['user-agent'] };
+        if (range) headers.Range = range;
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CONFIG.apiRequestTimeoutMs);
+
+        const driveRes = await fetch(driveUrl, { headers, signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (!driveRes.ok) {
+            return res.status(driveRes.status).send(await driveRes.text());
+        }
+
+        res.status(driveRes.status);
+        driveRes.headers.forEach((value, name) => {
+            // Let the client handle content-length if chunked
+            if (name.toLowerCase() !== 'transfer-encoding') {
+                 res.setHeader(name, value);
+            }
+        });
+        driveRes.body.pipe(res);
+
+    } catch (error) {
+        if (error.name !== 'AbortError') {
+             console.error('Playback handler error:', error);
+             res.status(500).send("Internal server error");
+        }
+    }
 }
 
 
