@@ -1,5 +1,5 @@
-// index.js - GDrive Addon v1.1.1 (Stability and Features Update)
-// Fixes streaming, large folder pagination, season/episode detection, and thumbnail handling.
+// index.js - GDrive Addon v1.1.2 (Major Stability and Caching Fix)
+// Fixes Redis JSON parsing, streaming reliability, and large folder loading.
 
 require('dotenv').config();
 const express = require("express");
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 // ========= CONFIGURATION =========
 const CONFIG = {
     addonName: "GDrive Stremio",
-    addonVersion: "1.1.1",
+    addonVersion: "1.1.2",
     baseUrl: process.env.BASE_URL || "http://127.0.0.1:3000",
     rootFolders: [
         { id: "1X18vIlx0I74wcXLYFYkKs1Xo_vW9jw6i", name: "Hindi Dubbed" },
@@ -32,9 +32,8 @@ const CONFIG = {
     ],
     proxiedPlayback: true,
     apiRequestTimeoutMs: 60000,
-    listCacheTtl: 300,
-    metaCacheTtl: 1800,
-    pageSize: 1000, // Max page size for Drive API
+    listCacheTtl: 300,      // 5 minutes for catalog listings
+    metaCacheTtl: 1800,     // 30 minutes for metadata
 };
 
 // ========= OAUTH 2.0 CREDENTIALS =========
@@ -50,7 +49,7 @@ const kvCache = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_
     ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
     : { get: async () => null, set: async () => {}, del: async () => {} };
 
-console.log(process.env.UPSTASH_REDIS_REST_URL ? "Upstash Redis cache initialized." : "Using mock in-memory cache.");
+console.log(process.env.UPSTASH_REDIS_REST_URL ? "Upstash Redis cache initialized." : "Using mock in-memory cache (no caching).");
 
 const API = {
     DRIVE_FILES: "https://www.googleapis.com/drive/v3/files",
@@ -81,7 +80,7 @@ async function getAccessToken() {
         if (!response.ok) throw new Error(data.error_description || 'Failed to refresh token');
         accessTokenCache = {
             token: data.access_token,
-            exp: Date.now() + (data.expires_in * 1000) - 60000
+            exp: Date.now() + ((data.expires_in || 3599) * 1000) - 60000
         };
         console.log("Successfully refreshed access token.");
         return accessTokenCache.token;
@@ -100,9 +99,17 @@ async function withAuthFetch(url, init = {}) {
 }
 
 async function gjson(url) {
-    const r = await withAuthFetch(url);
-    if (!r.ok) return null;
-    return r.json();
+    try {
+        const r = await withAuthFetch(url);
+        if (!r.ok) {
+            console.error(`API Error for ${url}: ${r.status}`);
+            return null;
+        }
+        return r.json();
+    } catch (e) {
+        console.error(`Fetch failed for ${url}:`, e);
+        return null;
+    }
 }
 
 async function listAllFiles(queryParams) {
@@ -112,7 +119,7 @@ async function listAllFiles(queryParams) {
         const url = new URL(API.DRIVE_FILES);
         const params = {
             ...queryParams,
-            pageSize: CONFIG.pageSize,
+            pageSize: 1000,
             pageToken: pageToken || undefined,
             supportsAllDrives: true,
             includeItemsFromAllDrives: true,
@@ -120,37 +127,32 @@ async function listAllFiles(queryParams) {
         url.search = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null)).toString();
         
         const data = await gjson(url.toString());
-        if (!data) break;
+        if (!data || !data.files) break;
 
-        if (data.files) allFiles = allFiles.concat(data.files);
+        allFiles.push(...data.files);
         pageToken = data.nextPageToken;
     } while (pageToken);
     return allFiles;
 }
 
 // ========= UTILITIES =========
-const fmtSize = (bytes) => (bytes ? `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB` : "Unknown");
-const extractId = (id, prefix) => id.startsWith(prefix) ? id.split(':')[1] : id;
+const fmtSize = (bytes) => (bytes ? `${(parseInt(bytes) / 1024 / 1024 / 1024).toFixed(2)} GB` : "Unknown");
+const extractId = (idStr, prefix) => idStr.startsWith(prefix) ? idStr.split(':')[1] : idStr;
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 function parseSeasonEpisode(name) {
     const patterns = [
-        /S(\d+)[._ ]?E(\d+)/i,
-        /Season[._ ]?(\d+)[._ ]?Episode[._ ]?(\d+)/i,
-        /(\d+)x(\d+)/i,
-        /\[(\d+)\.(\d+)\]/i
+        /S(\d{1,2})[._ ]?E(\d{1,3})/i,
+        /Season[._ ]?(\d{1,2})[._ ]?Episode[._ ]?(\d{1,3})/i,
+        /(\d{1,2})x(\d{1,3})/i,
+        /\[(\d{1,2})\.(\d{1,3})\]/i,
     ];
     for (const pattern of patterns) {
         const match = name.match(pattern);
-        if (match) {
-            return { season: parseInt(match[1]), episode: parseInt(match[2]) };
-        }
+        if (match) return { season: parseInt(match[1]), episode: parseInt(match[2]) };
     }
-    // Fallback for names like "01. My Episode"
-    const simpleMatch = name.match(/^(\d+)\./);
-    if (simpleMatch) {
-        return { season: 1, episode: parseInt(simpleMatch[1]) };
-    }
+    const simpleMatch = name.match(/^(\d{1,3})[._ ]/);
+    if (simpleMatch) return { season: 1, episode: parseInt(simpleMatch[1]) };
     return null;
 }
 
@@ -158,14 +160,14 @@ const fileToMeta = (file) => ({
     id: file.mimeType === FOLDER_MIME ? `gdrive-folder:${file.id}` : `gdrive:${file.id}`,
     type: file.mimeType === FOLDER_MIME ? 'series' : 'movie',
     name: file.name,
-    poster: file.thumbnailLink || (file.mimeType === FOLDER_MIME ? "https://i.imgur.com/G4A4B1a.png" : null),
+    poster: file.thumbnailLink ? file.thumbnailLink.replace(/=s\d+/, '=s400') : (file.mimeType === FOLDER_MIME ? "https://i.imgur.com/G4A4B1a.png" : null),
     posterShape: 'poster',
     description: file.mimeType !== FOLDER_MIME ? `Size: ${fmtSize(file.size)}` : ''
 });
 
 // ========= MANIFEST =========
 const getManifest = () => ({
-    id: "community.gdrive.v111",
+    id: "community.gdrive.v112",
     version: CONFIG.addonVersion,
     name: CONFIG.addonName,
     description: "Stable Google Drive addon with full series support, subtitle integration, and robust playback.",
@@ -185,27 +187,34 @@ async function handleCatalog(req, res) {
     const { id, search } = req.params;
     const cacheKey = `catalog:${search ? `search:${search}` : id}`;
     try {
+        // FIX: The @upstash/redis client auto-parses JSON. No need to JSON.parse() again.
         const cached = await kvCache.get(cacheKey);
-        if (cached) return res.json({ metas: JSON.parse(cached) });
+        if (cached) return res.json({ metas: cached });
     } catch (e) { console.error("Redis GET error:", e); }
 
     let files = [];
-    if (search) {
-        files = await listAllFiles({
-            q: `name contains '${search.replace(/'/g, "\\'")}' and trashed=false`,
-            fields: 'files(id,name,mimeType,thumbnailLink,size)',
-        });
-    } else {
-        const folderId = id === "gdrive_recents" ? 'root' : extractId(id, id.startsWith("gdrive-root:") ? "gdrive-root" : "gdrive-folder");
-        const orderBy = id === "gdrive_recents" ? 'createdTime desc' : 'name';
-        const q = id === "gdrive_recents" ? `mimeType contains 'video/' and trashed=false` : `'${folderId}' in parents and trashed=false`;
-        files = await listAllFiles({ q, orderBy, fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' });
+    try {
+        if (search) {
+            files = await listAllFiles({
+                q: `name contains '${search.replace(/'/g, "\\'")}' and trashed=false`,
+                fields: 'files(id,name,mimeType,thumbnailLink,size)',
+            });
+        } else {
+            const isRecents = id === "gdrive_recents";
+            const folderId = isRecents ? null : extractId(id, id.startsWith("gdrive-root:") ? "gdrive-root" : "gdrive-folder");
+            const orderBy = isRecents ? 'createdTime desc' : 'name';
+            const q = isRecents ? `mimeType contains 'video/' and trashed=false` : `'${folderId}' in parents and trashed=false`;
+            files = await listAllFiles({ q, orderBy, fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' });
+        }
+    } catch(e) {
+        console.error(`Error fetching catalog for id: ${id}`, e);
+        return res.status(500).json({ metas: [] });
     }
     
     const metas = files.map(fileToMeta);
     if (metas.length > 0) {
         try {
-            await kvCache.set(cacheKey, JSON.stringify(metas), { ex: CONFIG.listCacheTtl });
+            await kvCache.set(cacheKey, metas, { ex: CONFIG.listCacheTtl });
         } catch (e) { console.error("Redis SET error:", e); }
     }
     res.json({ metas });
@@ -221,8 +230,9 @@ async function handleMeta(req, res) {
     
     const cacheKey = `meta:${id}`;
     try {
+        // FIX: The @upstash/redis client auto-parses JSON.
         const cached = await kvCache.get(cacheKey);
-        if (cached) return res.json({ meta: JSON.parse(cached) });
+        if (cached) return res.json({ meta: cached });
     } catch(e) { console.error("Redis GET error:", e); }
 
     let meta;
@@ -238,7 +248,7 @@ async function handleMeta(req, res) {
         
         meta = {
             id, name: folder.name, type: 'series',
-            poster: firstVideoWithThumb ? firstVideoWithThumb.thumbnailLink : "https://i.imgur.com/G4A4B1a.png",
+            poster: firstVideoWithThumb ? firstVideoWithThumb.thumbnailLink.replace(/=s\d+/, '=s400') : "https://i.imgur.com/G4A4B1a.png",
             background: firstVideoWithThumb ? firstVideoWithThumb.thumbnailLink.replace(/=s\d+/, '=s1280') : null,
             videos: videos.map((file, index) => {
                 const parsed = parseSeasonEpisode(file.name);
@@ -248,7 +258,7 @@ async function handleMeta(req, res) {
                     season: parsed ? parsed.season : 1,
                     episode: parsed ? parsed.episode : index + 1,
                     released: file.createdTime,
-                    thumbnail: file.thumbnailLink,
+                    thumbnail: file.thumbnailLink ? file.thumbnailLink.replace(/=s\d+/, '=s400') : null,
                 };
             }).sort((a, b) => a.season - b.season || a.episode - b.episode)
         };
@@ -263,7 +273,7 @@ async function handleMeta(req, res) {
     }
 
     try {
-        await kvCache.set(cacheKey, JSON.stringify(meta), { ex: CONFIG.metaCacheTtl });
+        await kvCache.set(cacheKey, meta, { ex: CONFIG.metaCacheTtl });
     } catch(e) { console.error("Redis SET error:", e); }
     res.json({ meta });
 }
@@ -279,17 +289,19 @@ async function handleStream(req, res) {
     let subs = [];
     try {
         if (file.parents && file.parents[0]) {
-            const subFiles = await listAllFiles({ q: `'${file.parents[0]}' in parents and (name contains '.srt' or name contains '.vtt') and trashed=false`, fields: 'files(id,name)' });
-            subs = subFiles
-                .filter(sub => sub.name.toLowerCase().startsWith(file.name.toLowerCase().replace(/\.[^/.]+$/, "")))
-                .map(sub => {
-                    const langMatch = sub.name.match(/\.([a-z]{2})\.(srt|vtt)$/);
-                    return {
-                        id: `gdrive-sub:${sub.id}`,
-                        url: `${CONFIG.baseUrl}/subtitles/${sub.id}.srt`,
-                        lang: langMatch ? langMatch[1] : 'en'
-                    };
-                });
+            const fileNameWithoutExt = file.name.replace(/\.[^/.]+$/, "");
+            const subFiles = await listAllFiles({ 
+                q: `'${file.parents[0]}' in parents and (name contains '.srt' or name contains '.vtt') and name contains '${fileNameWithoutExt.replace(/'/g, "\\'")}' and trashed=false`, 
+                fields: 'files(id,name)' 
+            });
+            subs = subFiles.map(sub => {
+                const langMatch = sub.name.match(/\.([a-z]{2,3})\.(srt|vtt)$/i);
+                return {
+                    id: `gdrive-sub:${sub.id}`,
+                    url: `${CONFIG.baseUrl}/subtitles/${sub.id}.vtt`,
+                    lang: langMatch ? langMatch[1] : 'en'
+                };
+            });
         }
     } catch (e) {
         console.error("Subtitle search failed:", e);
@@ -336,12 +348,12 @@ async function handlePlayback(req, res) {
 
 async function handleSubtitles(req, res) {
     const { id } = req.params;
-    const fileId = id.replace('.srt','');
+    const fileId = id.replace(/\.(vtt|srt)$/,'');
     const accessToken = await getAccessToken();
     const driveUrl = API.DRIVE_MEDIA(fileId);
     const driveRes = await fetch(driveUrl, { headers: { 'Authorization': `Bearer ${accessToken}` } });
     if (!driveRes.ok) return res.status(driveRes.status).send(await driveRes.text());
-    res.setHeader('Content-Type', 'text/plain;charset=utf-8');
+    res.setHeader('Content-Type', 'text/vtt;charset=utf-8');
     driveRes.body.pipe(res);
 }
 
