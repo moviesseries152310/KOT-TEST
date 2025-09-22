@@ -1,5 +1,5 @@
-// index.js - GDrive Addon v1.1.2 (Major Stability and Caching Fix)
-// Fixes Redis JSON parsing, streaming reliability, and large folder loading.
+// index.js - GDrive Addon v1.1.3 (Final Stability Release)
+// Fixes search, catalog handling, streaming, and caching logic.
 
 require('dotenv').config();
 const express = require("express");
@@ -11,7 +11,7 @@ const timeout = require("connect-timeout");
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(timeout("120s")); // Increased timeout for large GDrive queries
+app.use(timeout("120s"));
 app.use((req, res, next) => {
     if (!req.timedout) next();
 });
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 // ========= CONFIGURATION =========
 const CONFIG = {
     addonName: "GDrive Stremio",
-    addonVersion: "1.1.2",
+    addonVersion: "1.1.3",
     baseUrl: process.env.BASE_URL || "http://127.0.0.1:3000",
     rootFolders: [
         { id: "1X18vIlx0I74wcXLYFYkKs1Xo_vW9jw6i", name: "Hindi Dubbed" },
@@ -32,24 +32,24 @@ const CONFIG = {
     ],
     proxiedPlayback: true,
     apiRequestTimeoutMs: 60000,
-    listCacheTtl: 300,      // 5 minutes for catalog listings
-    metaCacheTtl: 1800,     // 30 minutes for metadata
+    listCacheTtl: 300,
+    metaCacheTtl: 1800,
 };
 
 // ========= OAUTH 2.0 CREDENTIALS =========
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN } = process.env;
 
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
-    console.error("CRITICAL: Google OAuth credentials are not set in environment variables.");
+    console.error("CRITICAL: Google OAuth credentials are not set.");
     process.exit(1);
 }
 
 // ========= CACHING AND API SETUP =========
 const kvCache = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
     ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
-    : { get: async () => null, set: async () => {}, del: async () => {} };
+    : { get: async () => null, set: async () => {} };
 
-console.log(process.env.UPSTASH_REDIS_REST_URL ? "Upstash Redis cache initialized." : "Using mock in-memory cache (no caching).");
+console.log(process.env.UPSTASH_REDIS_REST_URL ? "Upstash Redis cache initialized." : "Using mock in-memory cache.");
 
 const API = {
     DRIVE_FILES: "https://www.googleapis.com/drive/v3/files",
@@ -137,15 +137,12 @@ async function listAllFiles(queryParams) {
 
 // ========= UTILITIES =========
 const fmtSize = (bytes) => (bytes ? `${(parseInt(bytes) / 1024 / 1024 / 1024).toFixed(2)} GB` : "Unknown");
-const extractId = (idStr, prefix) => idStr.startsWith(prefix) ? idStr.split(':')[1] : idStr;
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 function parseSeasonEpisode(name) {
     const patterns = [
-        /S(\d{1,2})[._ ]?E(\d{1,3})/i,
-        /Season[._ ]?(\d{1,2})[._ ]?Episode[._ ]?(\d{1,3})/i,
-        /(\d{1,2})x(\d{1,3})/i,
-        /\[(\d{1,2})\.(\d{1,3})\]/i,
+        /S(\d{1,2})[._ ]?E(\d{1,3})/i, /Season[._ ]?(\d{1,2})[._ ]?Episode[._ ]?(\d{1,3})/i,
+        /(\d{1,2})x(\d{1,3})/i, /\[(\d{1,2})\.(\d{1,3})\]/i,
     ];
     for (const pattern of patterns) {
         const match = name.match(pattern);
@@ -167,7 +164,7 @@ const fileToMeta = (file) => ({
 
 // ========= MANIFEST =========
 const getManifest = () => ({
-    id: "community.gdrive.v112",
+    id: "community.gdrive.v113",
     version: CONFIG.addonVersion,
     name: CONFIG.addonName,
     description: "Stable Google Drive addon with full series support, subtitle integration, and robust playback.",
@@ -185,9 +182,11 @@ const getManifest = () => ({
 // ========= HANDLERS =========
 async function handleCatalog(req, res) {
     const { id, search } = req.params;
-    const cacheKey = `catalog:${search ? `search:${search}` : id}`;
+    // FIX: Do not use special characters in cache keys that might not be supported.
+    const cleanSearch = search ? search.replace(/[^a-zA-Z0-9]/g, '') : '';
+    const cacheKey = `catalog:${cleanSearch ? `search-${cleanSearch}` : id}`;
+    
     try {
-        // FIX: The @upstash/redis client auto-parses JSON. No need to JSON.parse() again.
         const cached = await kvCache.get(cacheKey);
         if (cached) return res.json({ metas: cached });
     } catch (e) { console.error("Redis GET error:", e); }
@@ -196,15 +195,25 @@ async function handleCatalog(req, res) {
     try {
         if (search) {
             files = await listAllFiles({
-                q: `name contains '${search.replace(/'/g, "\\'")}' and trashed=false`,
+                q: `name contains '${search.replace(/'/g, "\\'")}' and trashed=false and (mimeType contains 'video/' or mimeType = '${FOLDER_MIME}')`,
                 fields: 'files(id,name,mimeType,thumbnailLink,size)',
             });
         } else {
-            const isRecents = id === "gdrive_recents";
-            const folderId = isRecents ? null : extractId(id, id.startsWith("gdrive-root:") ? "gdrive-root" : "gdrive-folder");
-            const orderBy = isRecents ? 'createdTime desc' : 'name';
-            const q = isRecents ? `mimeType contains 'video/' and trashed=false` : `'${folderId}' in parents and trashed=false`;
-            files = await listAllFiles({ q, orderBy, fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' });
+            // FIX: Correctly check for special catalog IDs before treating them as folder IDs.
+            if (id === "gdrive_recents") {
+                 files = await listAllFiles({ 
+                    q: `mimeType contains 'video/' and trashed=false`, 
+                    orderBy: 'createdTime desc', 
+                    fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' 
+                });
+            } else if (id.startsWith("gdrive-root:") || id.startsWith("gdrive-folder:")) {
+                const folderId = id.startsWith("gdrive-root:") ? id.split(':')[1] : id.split(':')[1];
+                files = await listAllFiles({ 
+                    q: `'${folderId}' in parents and trashed=false`, 
+                    orderBy: 'name', 
+                    fields: 'files(id,name,mimeType,thumbnailLink,size,createdTime)' 
+                });
+            }
         }
     } catch(e) {
         console.error(`Error fetching catalog for id: ${id}`, e);
@@ -224,13 +233,12 @@ async function handleMeta(req, res) {
     const { id } = req.params;
     const isFolder = id.startsWith('gdrive-folder:') || id.startsWith('gdrive-root:');
     const prefix = id.startsWith('gdrive-root:') ? 'gdrive-root' : (isFolder ? 'gdrive-folder' : 'gdrive');
-    const itemId = extractId(id, prefix);
+    const itemId = id.split(':')[1];
 
     if (!itemId) return res.status(404).json({ err: 'Not Found' });
     
     const cacheKey = `meta:${id}`;
     try {
-        // FIX: The @upstash/redis client auto-parses JSON.
         const cached = await kvCache.get(cacheKey);
         if (cached) return res.json({ meta: cached });
     } catch(e) { console.error("Redis GET error:", e); }
@@ -280,7 +288,7 @@ async function handleMeta(req, res) {
 
 async function handleStream(req, res) {
     const { id } = req.params;
-    const fileId = extractId(id, 'gdrive:');
+    const fileId = id.split(':')[1];
     if (!fileId) return res.status(404).json({ streams: [] });
 
     const file = await gjson(API.DRIVE_FILE(fileId, "id,name,size,parents"));
